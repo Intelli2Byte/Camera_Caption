@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Camera Caption — Public Production Dashboard
-Deployed on Streamlit Cloud
-API key handled via st.secrets (hidden from users)
+Full visibility redesign with proper color contrast
 """
 
 import streamlit as st
@@ -12,12 +11,10 @@ import base64
 import tempfile
 import shutil
 import re
-from typing import List
-import requests
-import cv2
+from typing import List, Tuple
 
 # ─────────────────────────────────────────────
-# PAGE CONFIG — Must be first Streamlit call
+# PAGE CONFIG
 # ─────────────────────────────────────────────
 st.set_page_config(
     page_title="Camera Caption — AI Video Captioning",
@@ -25,936 +22,1334 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={
-        'Get Help': 'https://github.com/riyaaisky/video-caption-agent',
-        'Report a bug': 'https://github.com/riyaaisky/video-caption-agent/issues',
-        'About': (
+        "Get Help": "https://github.com/riyaaisky/camera_caption",
+        "Report a bug": "https://github.com/riyaaisky/camera_caption/issues",
+        "About": (
             "## 📷 Camera Caption\n"
             "Multi-Style AI Video Captioning Agent\n\n"
-            "Built with Fireworks AI · Qwen3.7 Plus + GLM-5.2\n\n"
+            "Powered by Fireworks AI · Qwen3.7 Plus + GLM-5.2\n\n"
             "AMD Hackathon 2025"
-        )
-    }
+        ),
+    },
 )
 
 # ─────────────────────────────────────────────
-# API KEY — From Streamlit secrets (hidden)
+# SAFE IMPORTS
+# ─────────────────────────────────────────────
+try:
+    import requests
+except ImportError:
+    st.error("❌ 'requests' library not found.")
+    st.stop()
+
+try:
+    import cv2
+    import numpy as np
+except ImportError as e:
+    st.error(f"❌ OpenCV failed to load: {e}")
+    st.stop()
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+
+# ─────────────────────────────────────────────
+# API KEY
 # ─────────────────────────────────────────────
 def get_api_key() -> str:
-    """
-    Get API key from Streamlit secrets (production)
-    Falls back to environment variable (local dev)
-    """
     try:
-        # Production: key stored in Streamlit Cloud secrets
-        return st.secrets["FIREWORKS_API_KEY"]
+        key = st.secrets.get("FIREWORKS_API_KEY", "")
+        if key:
+            return key
     except Exception:
-        # Local dev: key from .env file
-        from dotenv import load_dotenv
-        load_dotenv()
-        return os.getenv("FIREWORKS_API_KEY", "")
+        pass
+    return os.getenv("FIREWORKS_API_KEY", "")
 
 API_KEY = get_api_key()
 
 # ─────────────────────────────────────────────
-# CUSTOM CSS
+# CONSTANTS
+# ─────────────────────────────────────────────
+FIREWORKS_URL        = "https://api.fireworks.ai/inference/v1/chat/completions"
+VISION_MODEL         = "accounts/fireworks/models/qwen3p7-plus"
+TEXT_MODEL           = "accounts/fireworks/models/glm-5p2"
+MAX_VIDEO_MB         = 100
+MAX_REQUESTS_SESSION = 15
+
+STYLE_ICONS = {
+    "formal":            "📋",
+    "sarcastic":         "😏",
+    "humorous_tech":     "💻",
+    "humorous_non_tech": "😂",
+}
+STYLE_LABELS = {
+    "formal":            "Formal",
+    "sarcastic":         "Sarcastic",
+    "humorous_tech":     "Humorous Tech",
+    "humorous_non_tech": "Humorous Non-Tech",
+}
+STYLE_INSTRUCTIONS = {
+    "formal": (
+        "Write a formal 2-3 sentence description. "
+        "Use professional, academic language.", 0.6
+    ),
+    "sarcastic": (
+        "Write a sarcastic 2-3 sentence commentary. "
+        "Use dry wit and subtle irony.", 0.8
+    ),
+    "humorous_tech": (
+        "Write a funny 2-3 sentence tech caption. "
+        "Use programming terms: API, debug, git, deploy, code.", 0.9
+    ),
+    "humorous_non_tech": (
+        "Write a funny 2-3 sentence everyday caption. "
+        "Relatable humor. Absolutely NO tech terms.", 0.9
+    ),
+}
+SAMPLE_VIDEOS = {
+    "🌆 Urban Boulevard": (
+        "https://storage.googleapis.com/amd-hackathon-clips/"
+        "1860079-uhd_2560_1440_25fps.mp4"
+    ),
+    "🐱 Orange Kitten": (
+        "https://storage.googleapis.com/amd-hackathon-clips/"
+        "13825391-uhd_3840_2160_30fps.mp4"
+    ),
+    "💼 Office Worker": (
+        "https://storage.googleapis.com/amd-hackathon-clips/"
+        "3044693-uhd_3840_2160_24fps.mp4"
+    ),
+}
+SYSTEM_GUIDELINE = (
+    "You are Camera Caption, an automated API that produces raw caption strings. "
+    "Output ONLY the caption text. No preambles, no meta-commentary, "
+    "no thinking process. Start immediately with the caption itself."
+)
+
+# ─────────────────────────────────────────────
+# SESSION STATE
+# ──────────────────────────────────────��──────
+if "request_count" not in st.session_state:
+    st.session_state["request_count"] = 0
+if "selected_url" not in st.session_state:
+    st.session_state["selected_url"] = ""
+if "batch_tasks" not in st.session_state:
+    st.session_state["batch_tasks"] = []
+
+# ─────────────────────────────────────────────
+# CSS — HIGH CONTRAST VISIBLE DESIGN
 # ─────────────────────────────────────────────
 st.markdown("""
 <style>
-    /* ── Base ── */
-    .stApp {
-        background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 50%, #16213e 100%);
-        color: #e0e0e0;
-    }
+/* ══════════════════════════════════════
+   GLOBAL BASE
+══════════════════════════════════════ */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap');
 
-    /* ── Header ── */
-    .main-title {
-        font-size: 3.2rem;
-        font-weight: 900;
-        background: linear-gradient(90deg, #f59e0b, #ef4444, #a855f7);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        text-align: center;
-        padding: 1rem 0 0.2rem 0;
-        letter-spacing: -1px;
-    }
-    .subtitle {
-        text-align: center;
-        color: #94a3b8;
-        font-size: 1.1rem;
-        margin-bottom: 0.4rem;
-    }
-    .tagline {
-        text-align: center;
-        color: #f59e0b;
-        font-size: 0.95rem;
-        font-style: italic;
-        margin-bottom: 1.5rem;
-    }
+html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif !important;
+}
 
-    /* ── Stat boxes ── */
-    .stat-box {
-        background: rgba(255,255,255,0.05);
-        border: 1px solid rgba(245,158,11,0.3);
-        border-radius: 10px;
-        padding: 1rem;
-        text-align: center;
-    }
-    .stat-number {
-        font-size: 2rem;
-        font-weight: 900;
-        color: #f59e0b;
-    }
-    .stat-label {
-        font-size: 0.8rem;
-        color: #94a3b8;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-    }
+.stApp {
+    background: #0d1117 !important;
+    color: #f0f6fc !important;
+}
 
-    /* ── Caption cards ── */
-    .caption-card {
-        background: rgba(255,255,255,0.05);
-        border: 1px solid rgba(255,255,255,0.1);
-        border-radius: 12px;
-        padding: 1rem 1.2rem;
-        margin: 0.5rem 0;
-        transition: all 0.3s ease;
-    }
-    .caption-card:hover {
-        background: rgba(255,255,255,0.08);
-        border-color: rgba(245,158,11,0.5);
-        transform: translateY(-2px);
-    }
-    .caption-text {
-        color: #e2e8f0;
-        font-size: 0.95rem;
-        line-height: 1.6;
-        margin: 0;
-    }
+/* All default Streamlit text → white */
+p, span, div, label, li, td, th {
+    color: #f0f6fc !important;
+}
 
-    /* ── Style badges ── */
-    .style-badge {
-        display: inline-block;
-        padding: 3px 10px;
-        border-radius: 20px;
-        font-size: 0.75rem;
-        font-weight: 700;
-        margin-bottom: 6px;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-    }
-    .badge-formal {
-        background: rgba(59,130,246,0.2);
-        color: #60a5fa;
-        border: 1px solid #3b82f6;
-    }
-    .badge-sarcastic {
-        background: rgba(239,68,68,0.2);
-        color: #f87171;
-        border: 1px solid #ef4444;
-    }
-    .badge-humorous_tech {
-        background: rgba(16,185,129,0.2);
-        color: #34d399;
-        border: 1px solid #10b981;
-    }
-    .badge-humorous_non_tech {
-        background: rgba(245,158,11,0.2);
-        color: #fbbf24;
-        border: 1px solid #f59e0b;
-    }
+h1, h2, h3, h4, h5, h6 {
+    color: #ffffff !important;
+    font-weight: 700 !important;
+}
 
-    /* ── Banners ── */
-    .success-banner {
-        background: rgba(16,185,129,0.15);
-        border: 1px solid #10b981;
-        border-radius: 10px;
-        padding: 1rem;
-        color: #34d399;
-        text-align: center;
-        font-weight: 600;
-        margin: 1rem 0;
-    }
-    .error-banner {
-        background: rgba(239,68,68,0.15);
-        border: 1px solid #ef4444;
-        border-radius: 10px;
-        padding: 1rem;
-        color: #f87171;
-        margin: 0.5rem 0;
-    }
-    .warning-banner {
-        background: rgba(245,158,11,0.15);
-        border: 1px solid #f59e0b;
-        border-radius: 10px;
-        padding: 1rem;
-        color: #fbbf24;
-        margin: 0.5rem 0;
-    }
+/* ══════════════════════════════════════
+   SIDEBAR
+══════════════════════════════════════ */
+[data-testid="stSidebar"] {
+    background: #161b22 !important;
+    border-right: 1px solid #30363d !important;
+}
 
-    /* ── Pipeline steps ── */
-    .pipeline-box {
-        background: rgba(245,158,11,0.08);
-        border: 1px solid rgba(245,158,11,0.3);
-        border-radius: 10px;
-        padding: 0.6rem 0.8rem;
-        font-size: 0.85rem;
-        color: #fbbf24;
-        margin-bottom: 6px;
-    }
+[data-testid="stSidebar"] * {
+    color: #f0f6fc !important;
+}
 
-    /* ── How-to card ── */
-    .howto-card {
-        background: rgba(255,255,255,0.04);
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 12px;
-        padding: 1.2rem;
-        margin: 0.5rem 0;
-    }
-    .howto-step {
-        display: flex;
-        align-items: flex-start;
-        gap: 0.8rem;
-        margin-bottom: 0.8rem;
-    }
-    .step-num {
-        background: #f59e0b;
-        color: #0f0f1a;
-        border-radius: 50%;
-        width: 24px;
-        height: 24px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-weight: 900;
-        font-size: 0.8rem;
-        flex-shrink: 0;
-    }
+[data-testid="stSidebar"] .stMarkdown p {
+    color: #c9d1d9 !important;
+}
 
-    /* ── Rate limit notice ── */
-    .rate-notice {
-        background: rgba(168,85,247,0.1);
-        border: 1px solid rgba(168,85,247,0.3);
-        border-radius: 10px;
-        padding: 0.8rem 1rem;
-        color: #c4b5fd;
-        font-size: 0.85rem;
-        margin: 0.5rem 0;
-    }
+/* ══════════════════════════════════════
+   INPUTS
+══════════════════════════════════════ */
+.stTextInput > div > div > input {
+    background: #21262d !important;
+    color: #f0f6fc !important;
+    border: 1px solid #30363d !important;
+    border-radius: 8px !important;
+    font-size: 0.95rem !important;
+}
 
-    /* ── Footer ── */
-    .footer-text {
-        text-align: center;
-        color: #475569;
-        font-size: 0.85rem;
-        padding: 1rem;
-    }
+.stTextInput > div > div > input::placeholder {
+    color: #8b949e !important;
+}
 
-    /* ── Hide Streamlit branding ── */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
+.stTextInput > div > div > input:focus {
+    border-color: #f59e0b !important;
+    box-shadow: 0 0 0 3px rgba(245,158,11,0.15) !important;
+}
+
+.stTextInput label {
+    color: #c9d1d9 !important;
+    font-weight: 600 !important;
+}
+
+/* ══════════════════════════════════════
+   MULTISELECT
+══════════════════════════════════════ */
+.stMultiSelect > div > div {
+    background: #21262d !important;
+    border: 1px solid #30363d !important;
+    border-radius: 8px !important;
+    color: #f0f6fc !important;
+}
+
+.stMultiSelect label {
+    color: #c9d1d9 !important;
+    font-weight: 600 !important;
+}
+
+[data-baseweb="tag"] {
+    background: rgba(245,158,11,0.2) !important;
+    border: 1px solid #f59e0b !important;
+    color: #fbbf24 !important;
+    border-radius: 6px !important;
+}
+
+[data-baseweb="tag"] span {
+    color: #fbbf24 !important;
+}
+
+/* ══════════════════════════════════════
+   SLIDER
+══════════════════════════════════════ */
+.stSlider label {
+    color: #c9d1d9 !important;
+    font-weight: 600 !important;
+}
+
+.stSlider [data-testid="stTickBarMin"],
+.stSlider [data-testid="stTickBarMax"] {
+    color: #8b949e !important;
+}
+
+/* ══════════════════════════════════════
+   RADIO
+══════════════════════════════════════ */
+.stRadio label {
+    color: #c9d1d9 !important;
+    font-weight: 500 !important;
+}
+
+.stRadio > div {
+    gap: 1rem !important;
+}
+
+/* ══════════════════════���═══════════════
+   BUTTONS
+══════════════════════════════════════ */
+.stButton > button {
+    background: #21262d !important;
+    color: #f0f6fc !important;
+    border: 1px solid #30363d !important;
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+    transition: all 0.2s ease !important;
+    padding: 0.5rem 1rem !important;
+}
+
+.stButton > button:hover {
+    background: #30363d !important;
+    border-color: #f59e0b !important;
+    color: #fbbf24 !important;
+    transform: translateY(-1px) !important;
+}
+
+/* Primary button */
+.stButton > button[kind="primary"],
+button[data-testid="baseButton-primary"] {
+    background: linear-gradient(135deg, #f59e0b, #d97706) !important;
+    color: #0d1117 !important;
+    border: none !important;
+    font-weight: 700 !important;
+    font-size: 1rem !important;
+    padding: 0.7rem 1.5rem !important;
+    border-radius: 10px !important;
+    box-shadow: 0 4px 15px rgba(245,158,11,0.3) !important;
+}
+
+.stButton > button[kind="primary"]:hover,
+button[data-testid="baseButton-primary"]:hover {
+    background: linear-gradient(135deg, #fbbf24, #f59e0b) !important;
+    box-shadow: 0 6px 20px rgba(245,158,11,0.4) !important;
+    transform: translateY(-2px) !important;
+    color: #0d1117 !important;
+}
+
+/* Download button */
+.stDownloadButton > button {
+    background: linear-gradient(135deg, #10b981, #059669) !important;
+    color: #ffffff !important;
+    border: none !important;
+    font-weight: 700 !important;
+    border-radius: 10px !important;
+    padding: 0.6rem 1.2rem !important;
+}
+
+.stDownloadButton > button:hover {
+    background: linear-gradient(135deg, #34d399, #10b981) !important;
+    transform: translateY(-1px) !important;
+    color: #ffffff !important;
+}
+
+/* ══════════════════════════════════════
+   FILE UPLOADER
+══════════════════════════════════════ */
+[data-testid="stFileUploader"] {
+    background: #161b22 !important;
+    border: 2px dashed #30363d !important;
+    border-radius: 10px !important;
+    padding: 1rem !important;
+}
+
+[data-testid="stFileUploader"] label {
+    color: #c9d1d9 !important;
+    font-weight: 600 !important;
+}
+
+[data-testid="stFileUploader"] p {
+    color: #8b949e !important;
+}
+
+/* ══════════════════════════════════════
+   TABS
+══════════════════════════════════════ */
+.stTabs [data-baseweb="tab-list"] {
+    background: #161b22 !important;
+    border-radius: 10px !important;
+    padding: 4px !important;
+    gap: 4px !important;
+    border: 1px solid #30363d !important;
+}
+
+.stTabs [data-baseweb="tab"] {
+    background: transparent !important;
+    color: #8b949e !important;
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+    padding: 0.5rem 1rem !important;
+    transition: all 0.2s ease !important;
+}
+
+.stTabs [data-baseweb="tab"]:hover {
+    color: #f0f6fc !important;
+    background: #21262d !important;
+}
+
+.stTabs [aria-selected="true"] {
+    background: linear-gradient(135deg, #f59e0b, #d97706) !important;
+    color: #0d1117 !important;
+    font-weight: 700 !important;
+}
+
+/* ══════════════════════════════════════
+   EXPANDER
+══════════════════════════════════════ */
+.streamlit-expanderHeader {
+    background: #161b22 !important;
+    color: #f0f6fc !important;
+    border: 1px solid #30363d !important;
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+}
+
+.streamlit-expanderContent {
+    background: #0d1117 !important;
+    border: 1px solid #30363d !important;
+    border-top: none !important;
+    border-radius: 0 0 8px 8px !important;
+}
+
+/* ══════════════════════════════════════
+   ALERTS (st.info, st.success, etc.)
+══════════════════════════════════════ */
+[data-testid="stAlert"] {
+    border-radius: 10px !important;
+}
+
+[data-testid="stAlert"] p {
+    font-size: 0.95rem !important;
+    font-weight: 500 !important;
+}
+
+/* st.info */
+.stAlert[data-baseweb="notification"][kind="info"] {
+    background: rgba(59,130,246,0.12) !important;
+    border: 1px solid rgba(59,130,246,0.4) !important;
+    color: #93c5fd !important;
+}
+
+/* st.success */
+.stAlert[data-baseweb="notification"][kind="positive"] {
+    background: rgba(16,185,129,0.12) !important;
+    border: 1px solid rgba(16,185,129,0.4) !important;
+    color: #6ee7b7 !important;
+}
+
+/* st.warning */
+.stAlert[data-baseweb="notification"][kind="warning"] {
+    background: rgba(245,158,11,0.12) !important;
+    border: 1px solid rgba(245,158,11,0.4) !important;
+    color: #fcd34d !important;
+}
+
+/* st.error */
+.stAlert[data-baseweb="notification"][kind="negative"] {
+    background: rgba(239,68,68,0.12) !important;
+    border: 1px solid rgba(239,68,68,0.4) !important;
+    color: #fca5a5 !important;
+}
+
+/* ══════════════════════════════════════
+   PROGRESS BAR
+══════════════════════════════════════ */
+.stProgress > div > div > div {
+    background: linear-gradient(90deg, #f59e0b, #d97706) !important;
+    border-radius: 10px !important;
+}
+
+.stProgress > div > div {
+    background: #21262d !important;
+    border-radius: 10px !important;
+}
+
+/* ══════════════════════════════════════
+   METRICS
+══════════════════════════════════════ */
+[data-testid="metric-container"] {
+    background: #161b22 !important;
+    border: 1px solid #30363d !important;
+    border-radius: 10px !important;
+    padding: 1rem !important;
+}
+
+[data-testid="metric-container"] label {
+    color: #8b949e !important;
+    font-size: 0.8rem !important;
+    text-transform: uppercase !important;
+    letter-spacing: 1px !important;
+}
+
+[data-testid="metric-container"] [data-testid="stMetricValue"] {
+    color: #f59e0b !important;
+    font-size: 1.8rem !important;
+    font-weight: 900 !important;
+}
+
+/* ══════════════════════════════════════
+   CODE BLOCKS
+══════════════════════════════════════ */
+.stCodeBlock {
+    background: #161b22 !important;
+    border: 1px solid #30363d !important;
+    border-radius: 8px !important;
+}
+
+.stCodeBlock code {
+    color: #e6edf3 !important;
+}
+
+/* ══════════════════════════════════════
+   DIVIDER
+══════════════════════════════════════ */
+hr {
+    border-color: #30363d !important;
+    margin: 1.5rem 0 !important;
+}
+
+/* ══════════════════════════════════════
+   CAPTION (st.caption)
+══════════════════════════════════════ */
+.stCaption, [data-testid="stCaptionContainer"] {
+    color: #8b949e !important;
+    font-size: 0.82rem !important;
+}
+
+/* ══════════════════════════════════════
+   IMAGES
+══════════════════════════════════════ */
+[data-testid="stImage"] {
+    border-radius: 8px !important;
+    overflow: hidden !important;
+    border: 1px solid #30363d !important;
+}
+
+/* ══════════════════════════════════════
+   HIDE STREAMLIT BRANDING
+══════════════════════════════════════ */
+#MainMenu  { visibility: hidden !important; }
+footer     { visibility: hidden !important; }
+header     { visibility: hidden !important; }
+
+/* ══════════════════════════════════════
+   CUSTOM COMPONENTS
+══════════════════════════════════════ */
+
+/* Main title */
+.cc-title {
+    font-size: 3.5rem;
+    font-weight: 900;
+    background: linear-gradient(90deg, #f59e0b 0%, #ef4444 50%, #a855f7 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    text-align: center;
+    padding: 1.5rem 0 0.3rem 0;
+    letter-spacing: -2px;
+    line-height: 1.1;
+}
+
+.cc-subtitle {
+    text-align: center;
+    color: #8b949e !important;
+    font-size: 1.05rem;
+    margin-bottom: 0.3rem;
+    font-weight: 400;
+}
+
+.cc-tagline {
+    text-align: center;
+    color: #f59e0b !important;
+    font-size: 1rem;
+    font-style: italic;
+    margin-bottom: 2rem;
+    font-weight: 500;
+}
+
+/* Stat boxes */
+.cc-stat {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 1.2rem 1rem;
+    text-align: center;
+    transition: border-color 0.2s ease;
+}
+
+.cc-stat:hover {
+    border-color: #f59e0b;
+}
+
+.cc-stat-num {
+    font-size: 2.2rem;
+    font-weight: 900;
+    color: #f59e0b !important;
+    line-height: 1;
+    margin-bottom: 0.3rem;
+}
+
+.cc-stat-label {
+    font-size: 0.75rem;
+    color: #8b949e !important;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    font-weight: 600;
+}
+
+/* Caption cards */
+.cc-card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 1.1rem 1.3rem;
+    margin: 0.6rem 0;
+    transition: all 0.25s ease;
+}
+
+.cc-card:hover {
+    background: #1c2128;
+    border-color: #f59e0b;
+    transform: translateY(-2px);
+    box-shadow: 0 4px 20px rgba(245,158,11,0.1);
+}
+
+/* Style badges */
+.cc-badge {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    margin-bottom: 8px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.cc-badge-formal {
+    background: rgba(59,130,246,0.15);
+    color: #93c5fd !important;
+    border: 1px solid rgba(59,130,246,0.5);
+}
+
+.cc-badge-sarcastic {
+    background: rgba(239,68,68,0.15);
+    color: #fca5a5 !important;
+    border: 1px solid rgba(239,68,68,0.5);
+}
+
+.cc-badge-humorous_tech {
+    background: rgba(16,185,129,0.15);
+    color: #6ee7b7 !important;
+    border: 1px solid rgba(16,185,129,0.5);
+}
+
+.cc-badge-humorous_non_tech {
+    background: rgba(245,158,11,0.15);
+    color: #fcd34d !important;
+    border: 1px solid rgba(245,158,11,0.5);
+}
+
+.cc-caption-text {
+    color: #e6edf3 !important;
+    font-size: 0.97rem;
+    line-height: 1.65;
+    margin: 0;
+    font-weight: 400;
+}
+
+/* Section headers */
+.cc-section {
+    color: #f0f6fc !important;
+    font-size: 1.2rem;
+    font-weight: 700;
+    margin: 1.5rem 0 0.8rem 0;
+    padding-bottom: 0.5rem;
+    border-bottom: 2px solid #30363d;
+}
+
+/* Banners */
+.cc-success {
+    background: rgba(16,185,129,0.12);
+    border: 1px solid rgba(16,185,129,0.5);
+    border-radius: 10px;
+    padding: 1rem 1.2rem;
+    color: #6ee7b7 !important;
+    font-weight: 600;
+    text-align: center;
+    margin: 1rem 0;
+}
+
+.cc-error {
+    background: rgba(239,68,68,0.12);
+    border: 1px solid rgba(239,68,68,0.5);
+    border-radius: 10px;
+    padding: 1rem 1.2rem;
+    color: #fca5a5 !important;
+    margin: 0.5rem 0;
+}
+
+.cc-warning {
+    background: rgba(245,158,11,0.12);
+    border: 1px solid rgba(245,158,11,0.5);
+    border-radius: 10px;
+    padding: 1rem 1.2rem;
+    color: #fcd34d !important;
+    margin: 0.5rem 0;
+}
+
+.cc-info {
+    background: rgba(59,130,246,0.1);
+    border: 1px solid rgba(59,130,246,0.4);
+    border-radius: 10px;
+    padding: 0.8rem 1rem;
+    color: #93c5fd !important;
+    font-size: 0.88rem;
+    margin: 0.5rem 0;
+}
+
+/* Pipeline steps */
+.cc-pipeline {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-left: 3px solid #f59e0b;
+    border-radius: 0 8px 8px 0;
+    padding: 0.55rem 0.9rem;
+    font-size: 0.88rem;
+    color: #c9d1d9 !important;
+    margin-bottom: 6px;
+    font-weight: 500;
+}
+
+/* How-to steps */
+.cc-step {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.9rem;
+    margin-bottom: 0.9rem;
+    padding: 0.7rem;
+    background: #161b22;
+    border-radius: 8px;
+    border: 1px solid #30363d;
+}
+
+.cc-step-num {
+    background: linear-gradient(135deg, #f59e0b, #d97706);
+    color: #0d1117 !important;
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 900;
+    font-size: 0.8rem;
+    flex-shrink: 0;
+    margin-top: 1px;
+}
+
+.cc-step-text {
+    color: #c9d1d9 !important;
+    font-size: 0.92rem;
+    line-height: 1.5;
+    padding-top: 2px;
+}
+
+/* Table */
+table {
+    background: #161b22 !important;
+    border-radius: 8px !important;
+    overflow: hidden !important;
+    width: 100% !important;
+}
+
+th {
+    background: #21262d !important;
+    color: #f0f6fc !important;
+    font-weight: 700 !important;
+    padding: 0.7rem 1rem !important;
+    border-bottom: 1px solid #30363d !important;
+}
+
+td {
+    color: #c9d1d9 !important;
+    padding: 0.6rem 1rem !important;
+    border-bottom: 1px solid #21262d !important;
+}
+
+tr:last-child td {
+    border-bottom: none !important;
+}
+
+/* Footer */
+.cc-footer {
+    text-align: center;
+    color: #484f58 !important;
+    font-size: 0.85rem;
+    padding: 1.5rem 1rem;
+    border-top: 1px solid #21262d;
+    margin-top: 1rem;
+}
+
+.cc-footer a {
+    color: #f59e0b !important;
+    text-decoration: none;
+    font-weight: 600;
+}
+
+.cc-footer a:hover {
+    color: #fbbf24 !important;
+    text-decoration: underline;
+}
+
+/* Sidebar brand */
+.cc-sidebar-brand {
+    background: linear-gradient(135deg, rgba(245,158,11,0.1), rgba(239,68,68,0.1));
+    border: 1px solid rgba(245,158,11,0.2);
+    border-radius: 10px;
+    padding: 0.8rem 1rem;
+    margin-bottom: 0.5rem;
+    text-align: center;
+}
+
+.cc-sidebar-title {
+    font-size: 1.3rem;
+    font-weight: 900;
+    background: linear-gradient(90deg, #f59e0b, #ef4444);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+
+.cc-sidebar-sub {
+    font-size: 0.78rem;
+    color: #8b949e !important;
+    margin-top: 2px;
+}
+
+/* Usage bar label */
+.cc-usage-label {
+    font-size: 0.82rem;
+    color: #8b949e !important;
+    margin-top: 4px;
+}
+
+/* Section divider with label */
+.cc-divider {
+    display: flex;
+    align-items: center;
+    gap: 0.8rem;
+    margin: 1.5rem 0;
+}
+
+.cc-divider-line {
+    flex: 1;
+    height: 1px;
+    background: #30363d;
+}
+
+.cc-divider-text {
+    color: #8b949e !important;
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    white-space: nowrap;
+}
 </style>
 """, unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────
-# CONSTANTS
+# HELPERS
 # ─────────────────────────────────────────────
-STYLE_ICONS = {
-    "formal":            "📋",
-    "sarcastic":         "😏",
-    "humorous_tech":     "💻",
-    "humorous_non_tech": "😂"
-}
-
-STYLE_LABELS = {
-    "formal":            "Formal",
-    "sarcastic":         "Sarcastic",
-    "humorous_tech":     "Humorous Tech",
-    "humorous_non_tech": "Humorous Non-Tech"
-}
-
-SAMPLE_VIDEOS = {
-    "🌆 Urban Autumn Boulevard": "https://storage.googleapis.com/amd-hackathon-clips/1860079-uhd_2560_1440_25fps.mp4",
-    "🐱 Orange Kitten in Garden": "https://storage.googleapis.com/amd-hackathon-clips/13825391-uhd_3840_2160_30fps.mp4",
-    "💼 Office Worker at Desk":   "https://storage.googleapis.com/amd-hackathon-clips/3044693-uhd_3840_2160_24fps.mp4",
-}
-
-# ─────────────────────────────────────────────
-# RATE LIMITING (per session)
-# ─────────────────────────────────────────────
-if "request_count" not in st.session_state:
-    st.session_state["request_count"] = 0
-
-MAX_REQUESTS_PER_SESSION = 10  # Adjust as needed
-
-
 def check_rate_limit() -> bool:
-    """Returns True if user is within rate limit"""
-    return st.session_state["request_count"] < MAX_REQUESTS_PER_SESSION
+    return st.session_state["request_count"] < MAX_REQUESTS_SESSION
 
-
-def increment_request_count():
+def increment_count():
     st.session_state["request_count"] += 1
+
+def clean_text(text: str, max_sentences: int = 3) -> str:
+    patterns = [
+        r'The user.*?[\n.]', r'Analysis:.*?[\n.]',
+        r'\*\*.*?\*\*', r'Frame \d+:.*?[\n.]',
+        r'Let me.*?[\n.]', r'I can see.*?[\n.]',
+        r'Based on.*?[\n.]', r"Here\'s.*?[\n.]", r'Sure.*?[\n.]',
+    ]
+    for p in patterns:
+        text = re.sub(p, '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+    text = re.sub(r'\*([^*]+)\*',     r'\1', text)
+    text = re.sub(
+        r'^(CAPTION:|Caption:|OUTPUT:|Here is|Here\'s|Based on|Sure|Okay)[:.\s]*',
+        '', text, flags=re.IGNORECASE
+    )
+    text = re.sub(r'\n+', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    text = text.strip().strip('"\'')
+    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if len(s.strip()) > 10]
+    if sentences:
+        text = '. '.join(sentences[:max_sentences])
+        if not text.endswith(('.', '!', '?')):
+            text += '.'
+    return text.strip()
+
+def render_caption_card(style: str, caption: str):
+    icon  = STYLE_ICONS.get(style, "📝")
+    label = STYLE_LABELS.get(style, style)
+    is_error = "[Error" in str(caption)
+    if is_error:
+        st.markdown(f"""
+        <div class="cc-error">
+            {icon} <strong>{label}:</strong> {caption}
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div class="cc-card">
+            <div class="cc-badge cc-badge-{style}">{icon} {label}</div>
+            <p class="cc-caption-text">{caption}</p>
+        </div>""", unsafe_allow_html=True)
+
+def section_header(icon: str, title: str):
+    st.markdown(
+        f'<div class="cc-section">{icon} {title}</div>',
+        unsafe_allow_html=True
+    )
+
+def divider_label(text: str):
+    st.markdown(f"""
+    <div class="cc-divider">
+        <div class="cc-divider-line"></div>
+        <div class="cc-divider-text">{text}</div>
+        <div class="cc-divider-line"></div>
+    </div>""", unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────
 # CORE AGENT FUNCTIONS
 # ─────────────────────────────────────────────
-
 def download_video(video_url: str, temp_dir: str) -> str:
-    """Download video with size limit (100MB max for public use)"""
-    response = requests.get(video_url, stream=True, timeout=120)
-    response.raise_for_status()
+    try:
+        response = requests.get(video_url, stream=True, timeout=120)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise ValueError(f"Could not download video: {e}")
 
-    # Check file size before downloading (100MB limit)
-    content_length = int(response.headers.get('content-length', 0))
-    if content_length > 100 * 1024 * 1024:
+    max_bytes = MAX_VIDEO_MB * 1024 * 1024
+    content_length = int(response.headers.get("content-length", 0))
+    if content_length > max_bytes:
         raise ValueError(
-            f"Video too large ({content_length // (1024*1024)}MB). "
-            "Maximum allowed size is 100MB for public use."
+            f"Video is {content_length//(1024*1024)}MB — max allowed is {MAX_VIDEO_MB}MB."
         )
 
     video_path = os.path.join(temp_dir, "video.mp4")
     downloaded = 0
-
-    with open(video_path, 'wb') as f:
+    with open(video_path, "wb") as f:
         for chunk in response.iter_content(chunk_size=2 * 1024 * 1024):
             f.write(chunk)
             downloaded += len(chunk)
-            # Safety: stop if exceeds 100MB
-            if downloaded > 100 * 1024 * 1024:
-                raise ValueError("Video exceeded 100MB limit during download.")
-
+            if downloaded > max_bytes:
+                raise ValueError(f"Video exceeded {MAX_VIDEO_MB}MB limit.")
     return video_path
 
-
-def extract_keyframes(video_path: str, max_frames: int = 4):
-    """Extract keyframes — returns base64 list, display frames, duration"""
+def extract_keyframes(video_path: str, max_frames: int = 4) -> Tuple[List[str], List, float]:
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError("Could not open video file.")
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    duration = total_frames / fps if fps > 0 else 0
-
+    fps          = cap.get(cv2.CAP_PROP_FPS)
+    duration     = total_frames / fps if fps > 0 else 0
+    if total_frames == 0:
+        raise ValueError("Video has no frames.")
     step = max(1, total_frames // max_frames)
     frame_indices = [i * step for i in range(min(max_frames, total_frames))]
-
-    base64_frames = []
-    display_frames = []
-
-    for frame_idx in frame_indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    base64_frames, display_frames = [], []
+    for idx in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
-        if ret:
-            # Display version (RGB)
-            display_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-            # API version (resized + compressed)
-            h, w = frame.shape[:2]
-            if w > 640:
-                frame = cv2.resize(frame, (640, int(h * 640 / w)))
-            _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-            base64_frames.append(base64.b64encode(buf).decode('utf-8'))
-
+        if not ret:
+            continue
+        display_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        h, w = frame.shape[:2]
+        if w > 640:
+            frame = cv2.resize(frame, (640, int(h * 640 / w)))
+        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        base64_frames.append(base64.b64encode(buf).decode("utf-8"))
     cap.release()
+    if not base64_frames:
+        raise ValueError("No frames could be extracted.")
     return base64_frames, display_frames, duration
 
-
-def analyze_video_with_qwen(frames: List[str]) -> str:
-    """Stage 1: Qwen3.7 Plus analyzes video frames"""
-    content = [{
-        "type": "text",
-        "text": (
-            "Describe this video in 3 clear sentences. "
-            "Start with 'The video shows'. "
-            "Cover: subjects, actions, setting, mood."
-        )
-    }]
-    for frame in frames:
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{frame}"}
-        })
-
+def call_api(payload: dict) -> str:
+    if not API_KEY:
+        raise ValueError("API key not configured.")
     response = requests.post(
-        "https://api.fireworks.ai/inference/v1/chat/completions",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {API_KEY}"
-        },
-        json={
-            "model": "accounts/fireworks/models/qwen3p7-plus",
-            "max_tokens": 120,
-            "temperature": 0.3,
-            "messages": [{"role": "user", "content": content}]
-        },
-        timeout=60
+        FIREWORKS_URL,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"},
+        json=payload, timeout=90,
     )
-    response.raise_for_status()
-    desc = response.json()['choices'][0]['message']['content'].strip()
+    if response.status_code == 401:
+        raise ValueError("Invalid API key.")
+    if response.status_code == 429:
+        raise ValueError("API rate limit reached. Please try again later.")
+    if response.status_code != 200:
+        raise ValueError(f"API error {response.status_code}: {response.text[:200]}")
+    return response.json()["choices"][0]["message"]["content"].strip()
 
-    # Clean artifacts
-    desc = re.sub(r'The user.*?[\n.]', '', desc, flags=re.I)
-    desc = re.sub(r'\*\*.*?\*\*', '', desc)
-    desc = re.sub(r'\n+', ' ', desc)
-    sentences = [s.strip() for s in re.split(r'[.!?]', desc) if len(s) > 15]
-    return '. '.join(sentences[:3]) + '.'
+def analyze_video(base64_frames: List[str]) -> str:
+    content = [{"type": "text", "text": (
+        "Describe this video in 3 clear sentences. "
+        "Start with 'The video shows'. "
+        "Cover: subjects, actions, setting, mood."
+    )}]
+    for frame in base64_frames:
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{frame}"}})
+    raw = call_api({
+        "model": VISION_MODEL, "max_tokens": 150, "temperature": 0.3,
+        "messages": [{"role": "user", "content": content}],
+    })
+    return clean_text(raw, 3)
 
+def generate_caption(description: str, style: str) -> str:
+    instruction, temperature = STYLE_INSTRUCTIONS.get(style, ("Write a 2-3 sentence caption.", 0.7))
+    raw = call_api({
+        "model": TEXT_MODEL, "max_tokens": 80, "temperature": temperature,
+        "presence_penalty": 0.3, "frequency_penalty": 0.3,
+        "messages": [
+            {"role": "system", "content": SYSTEM_GUIDELINE},
+            {"role": "user", "content": f"VIDEO: {description}\n\n{instruction}\n\nCAPTION:"},
+        ],
+    })
+    return clean_text(raw, 3)
 
-def generate_caption_with_glm(description: str, style: str) -> str:
-    """Stage 2: GLM-5.2 generates styled caption"""
-    style_map = {
-        "formal": (
-            "Write a formal 2-3 sentence description. "
-            "Use professional, academic language.",
-            0.6
-        ),
-        "sarcastic": (
-            "Write a sarcastic 2-3 sentence commentary. "
-            "Use dry wit and subtle irony.",
-            0.8
-        ),
-        "humorous_tech": (
-            "Write a funny 2-3 sentence tech caption. "
-            "Use programming terms: API, debug, git, deploy, code.",
-            0.9
-        ),
-        "humorous_non_tech": (
-            "Write a funny 2-3 sentence everyday caption. "
-            "Relatable humor. NO tech terms whatsoever.",
-            0.9
-        ),
-    }
-
-    instruction, temp = style_map.get(style, ("Write a 2-3 sentence caption.", 0.7))
-
-    response = requests.post(
-        "https://api.fireworks.ai/inference/v1/chat/completions",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {API_KEY}"
-        },
-        json={
-            "model": "accounts/fireworks/models/glm-5p2",
-            "max_tokens": 80,
-            "temperature": temp,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are Camera Caption, an automated API that produces "
-                        "raw caption strings. Output ONLY the caption text. "
-                        "No preambles, no meta-commentary, no thinking. "
-                        "Start immediately with the caption."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": f"VIDEO: {description}\n\n{instruction}\n\nCAPTION:"
-                }
-            ]
-        },
-        timeout=45
-    )
-    response.raise_for_status()
-    caption = response.json()['choices'][0]['message']['content'].strip()
-
-    # Clean artifacts
-    caption = re.sub(
-        r'^(CAPTION:|Caption:|Here\'s|Based on|Sure|Okay)[:.\s]*',
-        '', caption, flags=re.I
-    )
-    caption = caption.strip('"\'')
-    caption = re.sub(r'\*\*([^*]+)\*\*', r'\1', caption)
-    caption = re.sub(r'\n+', ' ', caption)
-    sentences = [s.strip() for s in re.split(r'[.!?]', caption) if len(s) > 10]
-    if sentences:
-        caption = '. '.join(sentences[:3])
-        if not caption.endswith(('.', '!', '?')):
-            caption += '.'
-    return caption
-
-
-def render_caption_card(style: str, caption: str):
-    """Render a styled caption card"""
-    icon = STYLE_ICONS.get(style, "📝")
-    label = STYLE_LABELS.get(style, style)
-    is_error = '[Error' in str(caption)
-
-    if is_error:
-        st.markdown(f"""
-        <div class="error-banner">
-            {icon} <strong>{label}</strong>: {caption}
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.markdown(f"""
-        <div class="caption-card">
-            <span class="style-badge badge-{style}">{icon} {label}</span>
-            <p class="caption-text">{caption}</p>
-        </div>
-        """, unsafe_allow_html=True)
-
-
-def process_single_video(video_url: str, styles: List[str], max_frames: int):
-    """Full pipeline for one video — returns description + captions dict"""
-    temp_dir = None
+def run_pipeline(video_url: str, styles: List[str], max_frames: int, pb=None, st_txt=None):
+    def upd(pct, msg):
+        if pb:  pb.progress(pct, text=msg)
+        if st_txt: st_txt.text(msg)
+    temp_dir = tempfile.mkdtemp()
     try:
-        temp_dir = tempfile.mkdtemp()
-
-        # Download
+        upd(10, "📥 Downloading video...")
         video_path = download_video(video_url, temp_dir)
-
-        # Extract frames
-        base64_frames, display_frames, duration = extract_keyframes(video_path, max_frames)
-
-        if not base64_frames:
-            raise ValueError("No keyframes could be extracted from this video.")
-
-        # Analyze
-        description = analyze_video_with_qwen(base64_frames)
-
-        # Generate captions
+        upd(30, "🖼️ Extracting keyframes...")
+        b64_frames, disp_frames, duration = extract_keyframes(video_path, max_frames)
+        upd(55, "👁️ Qwen3.7 analyzing scene...")
+        description = analyze_video(b64_frames)
         captions = {}
-        for style in styles:
-            captions[style] = generate_caption_with_glm(description, style)
-            increment_request_count()
-
-        return description, captions, display_frames, duration
-
+        n = len(styles)
+        for i, style in enumerate(styles):
+            upd(60 + int((i / n) * 35), f"✍️ Generating {STYLE_LABELS[style]}...")
+            captions[style] = generate_caption(description, style)
+            increment_count()
+        upd(100, "✅ Done!")
+        return description, captions, disp_frames
     finally:
-        if temp_dir and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 # ─────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────
-
 with st.sidebar:
-    st.markdown("## 📷 Camera Caption")
-    st.markdown("*Multi-Style AI Video Captioning*")
-    st.divider()
+    st.markdown("""
+    <div class="cc-sidebar-brand">
+        <div class="cc-sidebar-title">📷 Camera Caption</div>
+        <div class="cc-sidebar-sub">Multi-Style AI Video Captioning</div>
+    </div>
+    """, unsafe_allow_html=True)
 
     # API status
-    st.markdown("### 🔑 API Status")
     if API_KEY:
-        st.success("✅ API Connected")
+        st.success("✅ API Connected & Ready")
     else:
-        st.error("❌ API not configured")
+        st.error("❌ API key missing")
 
     st.divider()
 
-    # Style selector
     st.markdown("### 🎨 Caption Styles")
     selected_styles = st.multiselect(
         "Select styles to generate",
         options=list(STYLE_ICONS.keys()),
         default=list(STYLE_ICONS.keys()),
-        format_func=lambda x: f"{STYLE_ICONS[x]} {STYLE_LABELS[x]}"
+        format_func=lambda x: f"{STYLE_ICONS[x]} {STYLE_LABELS[x]}",
     )
 
     st.divider()
 
-    # Settings
     st.markdown("### ⚙️ Settings")
     max_frames = st.slider(
-        "Keyframes per video",
-        min_value=2,
-        max_value=6,
-        value=4,
-        help="More frames = better accuracy but slower"
+        "Keyframes per video", min_value=2, max_value=6, value=4,
+        help="More frames = better accuracy but slower",
     )
 
     st.divider()
 
-    # Pipeline
-    st.markdown("### 🔄 How It Works")
+    st.markdown("### 🔄 Pipeline")
     for step in [
         "📥 Download video",
         "🖼️ Extract keyframes",
         "👁️ Qwen3.7+ analyzes",
         "✍️ GLM-5.2 captions",
-        "📤 Export JSON"
+        "📤 Export JSON",
     ]:
-        st.markdown(f'<div class="pipeline-box">{step}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="cc-pipeline">{step}</div>', unsafe_allow_html=True)
 
     st.divider()
 
-    # Usage counter
-    remaining = MAX_REQUESTS_PER_SESSION - st.session_state["request_count"]
+    used      = st.session_state["request_count"]
+    remaining = MAX_REQUESTS_SESSION - used
     st.markdown("### 📊 Session Usage")
-    st.progress(
-        st.session_state["request_count"] / MAX_REQUESTS_PER_SESSION,
+    st.progress(min(used / MAX_REQUESTS_SESSION, 1.0))
+    st.markdown(
+        f'<div class="cc-usage-label">🔢 {remaining} generation(s) remaining</div>',
+        unsafe_allow_html=True
     )
-    st.caption(f"{remaining} caption generations remaining this session")
 
     st.divider()
     st.markdown(
-        "<div style='font-size:0.8rem;color:#475569'>"
-        "Built for AMD Hackathon 2025<br>"
-        "🐳 riyaaisky/video-caption-agent"
+        "<div style='font-size:0.78rem; color:#484f58; line-height:1.6'>"
+        "🏆 AMD Hackathon 2025<br>"
+        "🐳 riyaaisky/video-caption-agent<br>"
+        "⚡ Fireworks AI · Qwen3.7 + GLM-5.2"
         "</div>",
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
 
 # ─────────────────────────────────────────────
 # MAIN HEADER
 # ─────────────────────────────────────────────
-
-st.markdown('<div class="main-title">📷 Camera Caption</div>', unsafe_allow_html=True)
+st.markdown('<div class="cc-title">📷 Camera Caption</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="subtitle">Multi-Style AI Video Captioning · '
-    'Qwen3.7 Plus Vision + GLM-5.2 Text</div>',
-    unsafe_allow_html=True
+    '<div class="cc-subtitle">Multi-Style AI Video Captioning · Qwen3.7 Plus Vision + GLM-5.2 Text</div>',
+    unsafe_allow_html=True,
 )
 st.markdown(
-    '<div class="tagline">"One video. Four personalities. Zero effort."</div>',
-    unsafe_allow_html=True
+    '<div class="cc-tagline">"One video. Four personalities. Zero effort."</div>',
+    unsafe_allow_html=True,
 )
 
-# Stats row
+# Stats
 for col, num, label in zip(
     st.columns(4),
     ["2", "4", "<10m", "100MB"],
-    ["AI Models", "Caption Styles", "Runtime", "Max Video Size"]
+    ["AI Models", "Caption Styles", "Runtime", "Max Video Size"],
 ):
     with col:
-        st.markdown(f"""
-        <div class="stat-box">
-            <div class="stat-number">{num}</div>
-            <div class="stat-label">{label}</div>
-        </div>""", unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="cc-stat">'
+            f'<div class="cc-stat-num">{num}</div>'
+            f'<div class="cc-stat-label">{label}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# API key guard
 if not API_KEY:
     st.markdown("""
-    <div class="error-banner">
-        ❌ <strong>Service Unavailable</strong> — API key not configured.
-        Please contact the administrator.
-    </div>
-    """, unsafe_allow_html=True)
+    <div class="cc-error">
+        ❌ <strong>Service Unavailable</strong> —
+        API key not configured. Please contact the administrator.
+    </div>""", unsafe_allow_html=True)
     st.stop()
 
 
 # ─────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────
-
 tab1, tab2, tab3, tab4 = st.tabs([
     "🚀 Try It Now",
     "📁 Batch Process",
     "📊 Results Viewer",
-    "❓ How To Use"
+    "❓ How To Use",
 ])
 
 
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # TAB 1 — TRY IT NOW
-# ─────────────────────────────────────────────
-
+# ══════════════════════════════════════════════
 with tab1:
-    st.markdown("### 🎥 Caption Any Video Instantly")
+    section_header("🎥", "Caption Any Video Instantly")
 
-    # Rate limit check
     if not check_rate_limit():
         st.markdown("""
-        <div class="warning-banner">
+        <div class="cc-warning">
             ⚠️ <strong>Session limit reached.</strong>
-            You've used all 10 free generations this session.
-            Please refresh the page to start a new session.
-        </div>
-        """, unsafe_allow_html=True)
+            Refresh the page to start a new session.
+        </div>""", unsafe_allow_html=True)
     else:
-        # Input method
         input_method = st.radio(
             "Choose input method",
             ["⚡ Quick Test (Sample Videos)", "🔗 Paste Your Own URL"],
-            horizontal=True
+            horizontal=True,
         )
 
         video_url = ""
 
         if input_method == "⚡ Quick Test (Sample Videos)":
-            st.markdown("**Pick a sample video:**")
+            divider_label("pick a sample")
             cols = st.columns(len(SAMPLE_VIDEOS))
             for col, (label, url) in zip(cols, SAMPLE_VIDEOS.items()):
                 with col:
                     if st.button(label, use_container_width=True):
-                        st.session_state['selected_url'] = url
-
-            if 'selected_url' in st.session_state:
-                video_url = st.session_state['selected_url']
-                st.info(f"📎 Selected: {video_url[:60]}...")
-
+                        st.session_state["selected_url"] = url
+                        st.rerun()
+            if st.session_state["selected_url"]:
+                video_url = st.session_state["selected_url"]
+                st.markdown(
+                    f'<div class="cc-info">📎 Selected: <code>{video_url[:65]}...</code></div>',
+                    unsafe_allow_html=True
+                )
         else:
             video_url = st.text_input(
                 "Paste a direct MP4 video URL",
-                placeholder="https://example.com/video.mp4",
-                help="Must be a direct link to an MP4 file (max 100MB)"
+                placeholder="https://example.com/your-video.mp4",
+                help="Must be a direct link to an MP4 file (max 100MB)",
             )
             if video_url:
-                st.caption("⚠️ Only direct MP4 links are supported. Max file size: 100MB.")
+                st.caption("⚠️ Only direct MP4 links supported. Max 100MB.")
 
-        # Style check
         if not selected_styles:
-            st.warning("⚠️ Please select at least one caption style in the sidebar.")
+            st.warning("⚠️ Select at least one caption style in the sidebar.")
 
-        # Generate button
+        st.markdown("<br>", unsafe_allow_html=True)
         generate_btn = st.button(
             "📷 Generate Captions",
             type="primary",
             use_container_width=True,
-            disabled=(not video_url or not selected_styles)
+            disabled=(not video_url or not selected_styles),
         )
 
         if generate_btn and video_url and selected_styles:
-            with st.spinner("🎬 Camera Caption is working..."):
-                try:
-                    progress = st.progress(0, text="📥 Downloading video...")
-                    progress.progress(10, text="📥 Downloading video...")
+            pb  = st.progress(0, text="Starting...")
+            stx = st.empty()
+            try:
+                description, captions, display_frames = run_pipeline(
+                    video_url, selected_styles, max_frames, pb, stx
+                )
+                stx.empty()
 
-                    temp_dir = tempfile.mkdtemp()
-                    video_path = download_video(video_url, temp_dir)
-                    progress.progress(30, text="🖼️ Extracting keyframes...")
+                divider_label("extracted keyframes")
+                fcols = st.columns(len(display_frames))
+                for i, (c, f) in enumerate(zip(fcols, display_frames)):
+                    with c:
+                        st.image(f, caption=f"Frame {i+1}", use_container_width=True)
 
-                    base64_frames, display_frames, duration = extract_keyframes(
-                        video_path, max_frames
-                    )
-                    progress.progress(50, text="👁️ Qwen3.7 analyzing scene...")
+                divider_label("scene analysis · qwen3.7 plus")
+                st.info(f"🔍 **{description}**")
 
-                    # Show keyframes
-                    st.markdown("#### 🖼️ Extracted Keyframes")
-                    frame_cols = st.columns(len(display_frames))
-                    for i, (col, frame) in enumerate(zip(frame_cols, display_frames)):
-                        with col:
-                            st.image(frame, caption=f"Frame {i+1}", use_container_width=True)
+                divider_label("camera caption results · glm-5.2")
+                for style, caption in captions.items():
+                    render_caption_card(style, caption)
 
-                    # Analyze
-                    description = analyze_video_with_qwen(base64_frames)
-                    progress.progress(65, text="✍️ Generating styled captions...")
+                st.markdown("""
+                <div class="cc-success">
+                    🎉 All captions generated successfully by Camera Caption!
+                </div>""", unsafe_allow_html=True)
 
-                    st.markdown("#### 👁️ Scene Analysis (Qwen3.7 Plus)")
-                    st.info(f"**{description}**")
+                result = {
+                    "video_url": video_url,
+                    "scene_description": description,
+                    "captions": captions,
+                }
+                st.download_button(
+                    label="📥 Download Results as JSON",
+                    data=json.dumps([result], indent=2),
+                    file_name="camera_caption_results.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
 
-                    # Generate captions
-                    st.markdown("#### ✍️ Camera Caption Results")
-                    captions = {}
-                    for i, style in enumerate(selected_styles):
-                        caption = generate_caption_with_glm(description, style)
-                        captions[style] = caption
-                        increment_request_count()
-                        render_caption_card(style, caption)
-                        progress.progress(
-                            65 + int((i + 1) / len(selected_styles) * 30),
-                            text=f"✍️ Generated {style}..."
-                        )
+            except Exception as e:
+                pb.empty(); stx.empty()
+                st.markdown(
+                    f'<div class="cc-error">❌ <strong>Error:</strong> {e}</div>',
+                    unsafe_allow_html=True,
+                )
 
-                    progress.progress(100, text="✅ Done!")
-
-                    st.markdown("""
-                    <div class="success-banner">
-                        📷 Camera Caption — All captions generated successfully!
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                    # Download
-                    result = {
-                        "video_url": video_url,
-                        "scene_description": description,
-                        "captions": captions
-                    }
-                    st.download_button(
-                        label="📥 Download as JSON",
-                        data=json.dumps([result], indent=2),
-                        file_name="camera_caption_results.json",
-                        mime="application/json",
-                        use_container_width=True
-                    )
-
-                    # Cleanup
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-
-                except Exception as e:
-                    st.markdown(f"""
-                    <div class="error-banner">
-                        ❌ <strong>Error:</strong> {str(e)}
-                    </div>
-                    """, unsafe_allow_html=True)
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-
-        # Rate limit notice
-        st.markdown(f"""
-        <div class="rate-notice">
-            ℹ️ Free public demo · {MAX_REQUESTS_PER_SESSION} caption generations per session ·
-            Each video uses {len(selected_styles)} generation(s)
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="cc-info" style="margin-top:1rem">'
+            f'ℹ️ Free public demo · '
+            f'{MAX_REQUESTS_SESSION} generations per session · '
+            f'Each video uses {len(selected_styles)} generation(s)'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
 
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # TAB 2 — BATCH PROCESS
-# ─────────────────────────────────────────────
-
+# ══════════════════════════════════════════════
 with tab2:
-    st.markdown("### 📁 Batch Process Multiple Videos")
+    section_header("📁", "Batch Process Multiple Videos")
     st.markdown(
-        "Upload a `tasks.json` file to process multiple videos at once. "
-        "Perfect for the hackathon submission format."
+        '<p style="color:#8b949e; margin-bottom:1.5rem">'
+        'Upload a <code>tasks.json</code> file to process multiple videos at once. '
+        'Perfect for the hackathon submission format.'
+        '</p>',
+        unsafe_allow_html=True
     )
 
-    col_left, col_right = st.columns([1, 1])
+    col_left, col_right = st.columns(2)
 
     with col_left:
         st.markdown("#### 📤 Upload tasks.json")
         uploaded_file = st.file_uploader(
             "Upload your tasks.json",
-            type=['json'],
-            help="JSON array of tasks with task_id, video_url, and styles"
+            type=["json"],
+            help="JSON array with task_id, video_url, and styles",
         )
+        tasks_from_upload = []
         if uploaded_file:
             try:
-                tasks = json.load(uploaded_file)
-                st.success(f"✅ Loaded {len(tasks)} tasks")
-                with st.expander("Preview tasks.json"):
-                    st.json(tasks)
+                tasks_from_upload = json.load(uploaded_file)
+                st.success(f"✅ Loaded {len(tasks_from_upload)} task(s)")
+                with st.expander("👁️ Preview tasks.json"):
+                    st.json(tasks_from_upload)
             except Exception as e:
                 st.error(f"❌ Invalid JSON: {e}")
-                tasks = []
 
     with col_right:
         st.markdown("#### ⚡ Or Use Hackathon Test Clips")
         if st.button("📋 Load Hackathon Tasks", use_container_width=True):
-            st.session_state['batch_tasks'] = [
-                {
-                    "task_id": "v1",
-                    "video_url": SAMPLE_VIDEOS["🌆 Urban Autumn Boulevard"],
-                    "styles": list(STYLE_ICONS.keys())
-                },
-                {
-                    "task_id": "v2",
-                    "video_url": SAMPLE_VIDEOS["🐱 Orange Kitten in Garden"],
-                    "styles": list(STYLE_ICONS.keys())
-                },
-                {
-                    "task_id": "v3",
-                    "video_url": SAMPLE_VIDEOS["💼 Office Worker at Desk"],
-                    "styles": list(STYLE_ICONS.keys())
-                }
+            st.session_state["batch_tasks"] = [
+                {"task_id": "v1", "video_url": SAMPLE_VIDEOS["🌆 Urban Boulevard"],   "styles": list(STYLE_ICONS.keys())},
+                {"task_id": "v2", "video_url": SAMPLE_VIDEOS["🐱 Orange Kitten"],     "styles": list(STYLE_ICONS.keys())},
+                {"task_id": "v3", "video_url": SAMPLE_VIDEOS["💼 Office Worker"],     "styles": list(STYLE_ICONS.keys())},
             ]
             st.success("✅ Hackathon tasks loaded!")
 
         st.markdown("#### 📋 Expected Format")
-        st.code("""[
-  {
-    "task_id": "v1",
-    "video_url": "https://...",
-    "styles": [
-      "formal",
-      "sarcastic",
-      "humorous_tech",
-      "humorous_non_tech"
-    ]
-  }
-]""", language="json")
-
-    tasks_to_run = (
-        tasks if (uploaded_file and tasks)
-        else st.session_state.get('batch_tasks', [])
-    )
-
-    if tasks_to_run:
-        total_gens = sum(len(t.get('styles', selected_styles)) for t in tasks_to_run)
-        st.info(
-            f"📊 {len(tasks_to_run)} videos · "
-            f"{total_gens} total caption generations"
+        st.code(
+            '[\n  {\n    "task_id": "v1",\n'
+            '    "video_url": "https://...",\n'
+            '    "styles": [\n      "formal",\n      "sarcastic",\n'
+            '      "humorous_tech",\n      "humorous_non_tech"\n    ]\n  }\n]',
+            language="json",
         )
 
+    tasks_to_run = tasks_from_upload or st.session_state.get("batch_tasks", [])
+
+    if tasks_to_run:
+        total_gens = sum(len(t.get("styles", selected_styles)) for t in tasks_to_run)
+        st.info(f"📊 {len(tasks_to_run)} video(s) · {total_gens} total caption generation(s)")
+
         if not check_rate_limit():
-            st.markdown("""
-            <div class="warning-banner">
-                ⚠️ Session limit reached. Refresh to start a new session.
-            </div>
-            """, unsafe_allow_html=True)
+            st.markdown('<div class="cc-warning">⚠️ Session limit reached. Refresh to continue.</div>', unsafe_allow_html=True)
         else:
-            run_batch = st.button(
-                f"📷 Run Camera Caption on {len(tasks_to_run)} Videos",
-                type="primary",
-                use_container_width=True
-            )
-
-            if run_batch:
+            if st.button(f"📷 Run Camera Caption on {len(tasks_to_run)} Video(s)", type="primary", use_container_width=True):
                 all_results = []
-                overall_progress = st.progress(0, text="Starting batch...")
+                overall_pb  = st.progress(0, text="Starting batch...")
 
-                for task_idx, task in enumerate(tasks_to_run):
-                    task_id = task['task_id']
-                    styles = task.get('styles', selected_styles)
-                    overall_progress.progress(
-                        int(task_idx / len(tasks_to_run) * 100),
-                        text=f"Processing {task_id} ({task_idx+1}/{len(tasks_to_run)})..."
+                for idx, task in enumerate(tasks_to_run):
+                    task_id = task["task_id"]
+                    styles  = task.get("styles", selected_styles)
+                    overall_pb.progress(
+                        int(idx / len(tasks_to_run) * 100),
+                        text=f"Processing {task_id} ({idx+1}/{len(tasks_to_run)})..."
                     )
-
                     result = {"task_id": task_id, "captions": {}}
 
                     with st.expander(f"📹 Task: {task_id}", expanded=True):
-                        temp_dir = None
                         try:
                             p = st.progress(0)
                             s = st.empty()
-
-                            s.text("📥 Downloading...")
-                            temp_dir = tempfile.mkdtemp()
-                            video_path = download_video(task['video_url'], temp_dir)
-                            p.progress(25)
-
-                            s.text("🖼️ Extracting frames...")
-                            b64_frames, disp_frames, _ = extract_keyframes(
-                                video_path, max_frames
+                            description, captions, disp_frames = run_pipeline(
+                                task["video_url"], styles, max_frames, p, s
                             )
-
+                            s.empty()
                             fcols = st.columns(len(disp_frames))
                             for i, (c, f) in enumerate(zip(fcols, disp_frames)):
                                 with c:
                                     st.image(f, caption=f"Frame {i+1}", use_container_width=True)
-                            p.progress(45)
-
-                            s.text("👁️ Analyzing with Qwen...")
-                            description = analyze_video_with_qwen(b64_frames)
-                            st.info(f"**Scene:** {description}")
-                            p.progress(60)
-
-                            for i, style in enumerate(styles):
-                                s.text(f"✍️ Generating {style}...")
-                                caption = generate_caption_with_glm(description, style)
+                            st.info(f"🔍 **Scene:** {description}")
+                            for style, caption in captions.items():
                                 result["captions"][style] = caption
-                                increment_request_count()
                                 render_caption_card(style, caption)
-                                p.progress(60 + int((i+1)/len(styles)*35))
-
-                            p.progress(100)
-                            s.empty()
                             st.success(f"✅ Task {task_id} complete!")
-
                         except Exception as e:
                             st.error(f"❌ Task {task_id} failed: {e}")
                             for style in styles:
                                 if style not in result["captions"]:
                                     result["captions"][style] = f"[Error: {str(e)[:80]}]"
-                        finally:
-                            if temp_dir:
-                                shutil.rmtree(temp_dir, ignore_errors=True)
-
                     all_results.append(result)
 
-                overall_progress.progress(100, text="✅ All tasks complete!")
-
-                st.markdown("---")
-                st.markdown("### 📤 Final results.json")
+                overall_pb.progress(100, text="✅ All tasks complete!")
+                divider_label("final output")
                 results_json = json.dumps(all_results, indent=2)
                 st.code(results_json, language="json")
                 st.download_button(
@@ -962,186 +1357,157 @@ with tab2:
                     data=results_json,
                     file_name="results.json",
                     mime="application/json",
-                    use_container_width=True
+                    use_container_width=True,
                 )
 
 
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # TAB 3 — RESULTS VIEWER
-# ─────────────────────────────────────────────
-
+# ══════════════════════════════════════════════
 with tab3:
-    st.markdown("### 📊 View & Inspect Results")
+    section_header("📊", "View & Inspect Results")
 
     results_file = st.file_uploader(
         "Upload results.json to inspect",
-        type=['json'],
-        key="results_uploader"
+        type=["json"],
+        key="results_uploader",
     )
 
     if results_file:
         try:
-            results = json.load(results_file)
-            st.success(f"✅ Loaded {len(results)} results")
+            results    = json.load(results_file)
+            total_caps = sum(len(r.get("captions", {})) for r in results)
+            err_count  = sum(1 for r in results for c in r.get("captions", {}).values() if "[Error" in str(c))
 
-            total_captions = sum(len(r.get('captions', {})) for r in results)
-            error_count = sum(
-                1 for r in results
-                for c in r.get('captions', {}).values()
-                if '[Error' in str(c)
-            )
-            success_count = total_captions - error_count
+            st.success(f"✅ Loaded {len(results)} result(s)")
 
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Videos", len(results))
-            m2.metric("Total Captions", total_captions)
-            m3.metric("✅ Successful", success_count)
-            m4.metric("❌ Errors", error_count)
+            for col, val, label in zip(
+                st.columns(4),
+                [len(results), total_caps, total_caps - err_count, err_count],
+                ["Videos", "Total Captions", "✅ Successful", "❌ Errors"],
+            ):
+                col.metric(label, val)
 
             st.divider()
 
             for result in results:
-                task_id = result.get('task_id', 'Unknown')
-                captions = result.get('captions', {})
-
+                task_id  = result.get("task_id", "Unknown")
+                captions = result.get("captions", {})
                 with st.expander(f"📷 Task: {task_id}", expanded=True):
                     for style, caption in captions.items():
                         render_caption_card(style, caption)
 
-            # Download cleaned version
             st.download_button(
                 label="📥 Re-download results.json",
                 data=json.dumps(results, indent=2),
                 file_name="results.json",
                 mime="application/json",
-                use_container_width=True
+                use_container_width=True,
             )
-
         except Exception as e:
             st.error(f"❌ Could not parse file: {e}")
     else:
         st.info("👆 Upload a results.json file to inspect captions")
-        st.markdown("#### 📋 Expected Format")
-        st.code("""[
-  {
-    "task_id": "v1",
-    "captions": {
-      "formal": "The video depicts...",
-      "sarcastic": "Oh wow, another...",
-      "humorous_tech": "This is running on...",
-      "humorous_non_tech": "This has the energy of..."
-    }
-  }
-]""", language="json")
+        st.code(
+            '[\n  {\n    "task_id": "v1",\n    "captions": {\n'
+            '      "formal": "The video depicts...",\n'
+            '      "sarcastic": "Oh wow, another...",\n'
+            '      "humorous_tech": "This is running on...",\n'
+            '      "humorous_non_tech": "This has the energy of..."\n'
+            '    }\n  }\n]',
+            language="json",
+        )
 
 
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # TAB 4 — HOW TO USE
-# ─────────────────────────────────────────────
-
+# ══════════════════════════════════════════════
 with tab4:
-    st.markdown("### ❓ How to Use Camera Caption")
+    section_header("❓", "How to Use Camera Caption")
 
     col1, col2 = st.columns(2)
 
     with col1:
         st.markdown("#### 🚀 Quick Start")
-        st.markdown("""
-        <div class="howto-card">
-            <div class="howto-step">
-                <div class="step-num">1</div>
-                <div>Go to the <strong>🚀 Try It Now</strong> tab</div>
-            </div>
-            <div class="howto-step">
-                <div class="step-num">2</div>
-                <div>Click a <strong>sample video</strong> or paste your own MP4 URL</div>
-            </div>
-            <div class="howto-step">
-                <div class="step-num">3</div>
-                <div>Select your <strong>caption styles</strong> in the sidebar</div>
-            </div>
-            <div class="howto-step">
-                <div class="step-num">4</div>
-                <div>Click <strong>📷 Generate Captions</strong></div>
-            </div>
-            <div class="howto-step">
-                <div class="step-num">5</div>
-                <div>Download your results as <strong>JSON</strong></div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        st.markdown("#### 🎨 Caption Styles Explained")
-        for style, icon in STYLE_ICONS.items():
-            descriptions = {
-                "formal": "Professional, objective, academic tone",
-                "sarcastic": "Dry wit, ironic, lightly mocking",
-                "humorous_tech": "Programming jokes, coding references",
-                "humorous_non_tech": "Universal everyday humor, no tech terms"
-            }
+        for num, text in enumerate([
+            "Go to the <strong>🚀 Try It Now</strong> tab",
+            "Click a <strong>sample video</strong> or paste your own MP4 URL",
+            "Select your <strong>caption styles</strong> in the sidebar",
+            "Click <strong>📷 Generate Captions</strong>",
+            "Download your results as <strong>JSON</strong>",
+        ], 1):
             st.markdown(f"""
-            <div class="caption-card" style="margin:4px 0">
-                <span class="style-badge badge-{style}">{icon} {STYLE_LABELS[style]}</span>
-                <p class="caption-text" style="font-size:0.85rem">{descriptions[style]}</p>
-            </div>
-            """, unsafe_allow_html=True)
+            <div class="cc-step">
+                <div class="cc-step-num">{num}</div>
+                <div class="cc-step-text">{text}</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("#### 🎨 Caption Styles")
+        descriptions = {
+            "formal":            "Professional, objective, academic tone",
+            "sarcastic":         "Dry wit, ironic, lightly mocking",
+            "humorous_tech":     "Programming jokes, coding references",
+            "humorous_non_tech": "Universal everyday humor, no tech terms",
+        }
+        for style, icon in STYLE_ICONS.items():
+            st.markdown(f"""
+            <div class="cc-card" style="margin:4px 0; padding:0.8rem 1rem">
+                <div class="cc-badge cc-badge-{style}">{icon} {STYLE_LABELS[style]}</div>
+                <p class="cc-caption-text" style="font-size:0.88rem; margin-top:4px">
+                    {descriptions[style]}
+                </p>
+            </div>""", unsafe_allow_html=True)
 
     with col2:
         st.markdown("#### 📁 Batch Processing")
-        st.markdown("""
-        <div class="howto-card">
-            <div class="howto-step">
-                <div class="step-num">1</div>
-                <div>Go to the <strong>📁 Batch Process</strong> tab</div>
-            </div>
-            <div class="howto-step">
-                <div class="step-num">2</div>
-                <div>Upload a <strong>tasks.json</strong> file or load sample tasks</div>
-            </div>
-            <div class="howto-step">
-                <div class="step-num">3</div>
-                <div>Click <strong>Run Camera Caption</strong></div>
-            </div>
-            <div class="howto-step">
-                <div class="step-num">4</div>
-                <div>Download the final <strong>results.json</strong></div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+        for num, text in enumerate([
+            "Go to the <strong>📁 Batch Process</strong> tab",
+            "Upload a <strong>tasks.json</strong> or load sample tasks",
+            "Click <strong>Run Camera Caption</strong>",
+            "Download the final <strong>results.json</strong>",
+        ], 1):
+            st.markdown(f"""
+            <div class="cc-step">
+                <div class="cc-step-num">{num}</div>
+                <div class="cc-step-text">{text}</div>
+            </div>""", unsafe_allow_html=True)
 
+        st.markdown("<br>", unsafe_allow_html=True)
         st.markdown("#### ⚙️ Technical Details")
         st.markdown("""
-        | Component | Detail |
-        |-----------|--------|
-        | Vision Model | Qwen3.7 Plus |
-        | Text Model | GLM-5.2 |
-        | API Provider | Fireworks AI |
-        | Max Video Size | 100MB |
-        | Keyframes | 2–6 per video |
-        | Output Format | JSON |
-        """)
-
+| Component | Detail |
+|-----------|--------|
+| Vision Model | Qwen3.7 Plus |
+| Text Model | GLM-5.2 |
+| API Provider | Fireworks AI |
+| Max Video Size | 100 MB |
+| Keyframes | 2–6 per video |
+| Output Format | JSON |
+""")
+        st.markdown("<br>", unsafe_allow_html=True)
         st.markdown("#### 🐳 Docker Deployment")
         st.code("docker pull riyaaisky/video-caption-agent:latest", language="bash")
-        st.code("""docker run --rm \\
-  -v /path/to/input:/input:ro \\
-  -v /path/to/output:/output \\
-  -e FIREWORKS_API_KEY=$KEY \\
-  riyaaisky/video-caption-agent:latest""", language="bash")
+        st.code(
+            "docker run --rm \\\n"
+            "  -v /path/to/input:/input:ro \\\n"
+            "  -v /path/to/output:/output \\\n"
+            "  -e FIREWORKS_API_KEY=$KEY \\\n"
+            "  riyaaisky/video-caption-agent:latest",
+            language="bash",
+        )
 
 
 # ─────────────────────────────────────────────
 # FOOTER
-# ─────────────────────────────────────────────
-
-st.divider()
+# ────────────────────────��────────────────────
 st.markdown("""
-<div class="footer-text">
-    📷 <strong>Camera Caption</strong> · Powered by
-    <a href="https://fireworks.ai" style="color:#f59e0b">Fireworks AI</a> ·
-    Qwen3.7 Plus + GLM-5.2 · AMD Hackathon 2025 ·
-    <a href="https://github.com/Intelli2Byte/Camera_Caption"
-       style="color:#f59e0b">GitHub</a> ·
+<div class="cc-footer">
+    📷 <strong>Camera Caption</strong> &nbsp;·&nbsp;
+    Powered by <a href="https://fireworks.ai">Fireworks AI</a> &nbsp;·&nbsp;
+    Qwen3.7 Plus + GLM-5.2 &nbsp;·&nbsp;
+    AMD Hackathon 2025 &nbsp;·&nbsp;
+    <a href="https://github.com/riyaaisky/camera_caption">GitHub</a> &nbsp;·&nbsp;
     🐳 riyaaisky/video-caption-agent:latest
 </div>
 """, unsafe_allow_html=True)
