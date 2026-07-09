@@ -45,10 +45,17 @@ except ImportError:
 try:
     import cv2
     import numpy as np
-except ImportError as e:
-    st.error(f"❌ OpenCV failed to load: {e}")
+    # Quick sanity check
+    _test = cv2.VideoCapture
+    OPENCV_OK = True
+except Exception as e:
+    OPENCV_OK = False
+    st.error(
+        f"❌ OpenCV failed to load: `{e}`\n\n"
+        "**Fix:** Make sure `packages.txt` contains `libgl1-mesa-glx` "
+        "and redeploy the app."
+    )
     st.stop()
-
 try:
     from dotenv import load_dotenv
     load_dotenv()
